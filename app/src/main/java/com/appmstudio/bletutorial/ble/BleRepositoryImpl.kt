@@ -9,7 +9,6 @@ import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothGattService
 import android.bluetooth.BluetoothManager
 import android.bluetooth.le.ScanCallback
-import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.BroadcastReceiver
@@ -37,7 +36,9 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
+import java.nio.charset.StandardCharsets
 import java.util.concurrent.ConcurrentHashMap
+import java.util.UUID
 import javax.inject.Inject
 
 @SuppressLint("MissingPermission")
@@ -68,6 +69,7 @@ class BleRepositoryImpl @Inject constructor(
 
     private var scanCallback: ScanCallback? = null
     private val scanResults = ConcurrentHashMap<String, BleDevice>()
+    private val deviceNameCache = ConcurrentHashMap<String, String>()
 
     private var gatt: BluetoothGatt? = null
     private var readCharacteristic: BluetoothGattCharacteristic? = null
@@ -110,18 +112,20 @@ class BleRepositoryImpl @Inject constructor(
             return
         }
         scanResults.clear()
+        val normalizedNameFilter = nameFilter?.trim()?.takeIf { it.isNotEmpty() }
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
-        val filters = if (!nameFilter.isNullOrBlank()) {
-            listOf(ScanFilter.Builder().setDeviceName(nameFilter).build())
-        } else {
-            emptyList()
-        }
         scanCallback = object : ScanCallback() {
             override fun onScanResult(callbackType: Int, result: ScanResult) {
                 val device = result.device ?: return
-                val name = device.name ?: "Unknown"
+                val name = resolveDeviceName(result, scanResults[device.address])
+                if (name != UNKNOWN_DEVICE_NAME) {
+                    cacheResolvedName(device.address, name)
+                }
+                if (normalizedNameFilter != null && !name.contains(normalizedNameFilter, ignoreCase = true)) {
+                    return
+                }
                 val bleDevice = BleDevice(name, device.address, result.rssi)
                 scanResults[device.address] = bleDevice
                 _scannedDevices.value = scanResults.values.sortedByDescending { it.rssi }
@@ -135,7 +139,7 @@ class BleRepositoryImpl @Inject constructor(
                 _connectionState.value = ConnectionState.Error("Scan failed: $errorCode")
             }
         }
-        scanner.startScan(filters, settings, scanCallback)
+        scanner.startScan(emptyList(), settings, scanCallback)
     }
 
     override fun stopScan() {
@@ -304,6 +308,75 @@ class BleRepositoryImpl @Inject constructor(
             }
     }
 
+    private fun resolveDeviceName(result: ScanResult, previous: BleDevice?): String {
+        val discoveredName = sequenceOf(
+            result.scanRecord?.deviceName,
+            parseNameFromAdvertising(result.scanRecord?.bytes),
+            result.device?.name
+        ).firstOrNull { !it.isNullOrBlank() }?.trim()
+        if (!discoveredName.isNullOrEmpty()) return discoveredName
+
+        val previousKnownName = previous?.name?.takeUnless { it == UNKNOWN_DEVICE_NAME }
+        if (!previousKnownName.isNullOrBlank()) return previousKnownName
+
+        val cachedName = deviceNameCache[result.device?.address]
+        if (!cachedName.isNullOrBlank()) return cachedName
+
+        val bondedName = adapter?.bondedDevices
+            ?.firstOrNull { it.address == result.device?.address }
+            ?.name
+            ?.trim()
+        if (!bondedName.isNullOrBlank()) return bondedName
+
+        return UNKNOWN_DEVICE_NAME
+    }
+
+    private fun cacheResolvedName(address: String, name: String) {
+        deviceNameCache[address] = name
+        val existing = scanResults[address] ?: return
+        if (existing.name == name) return
+        scanResults[address] = existing.copy(name = name)
+        _scannedDevices.value = scanResults.values.sortedByDescending { it.rssi }
+    }
+
+    private fun parseNameFromAdvertising(payload: ByteArray?): String? {
+        if (payload == null || payload.isEmpty()) return null
+        var index = 0
+        while (index < payload.size) {
+            val length = payload[index].toInt() and 0xFF
+            if (length == 0) break
+            val fieldStart = index + 1
+            val fieldTypeIndex = fieldStart
+            val fieldDataStart = fieldStart + 1
+            val fieldDataEndExclusive = fieldStart + length
+            if (fieldDataEndExclusive > payload.size) break
+            val fieldType = payload[fieldTypeIndex].toInt() and 0xFF
+            if (fieldType == 0x08 || fieldType == 0x09) {
+                val size = fieldDataEndExclusive - fieldDataStart
+                if (size > 0) {
+                    return String(payload, fieldDataStart, size, StandardCharsets.UTF_8).trim()
+                        .takeIf { it.isNotEmpty() }
+                }
+            }
+            index += (length + 1)
+        }
+        return null
+    }
+
+    private fun readDeviceNameFromGatt(gatt: BluetoothGatt) {
+        val genericAccess = gatt.getService(GENERIC_ACCESS_SERVICE_UUID) ?: return
+        val deviceNameCharacteristic = genericAccess.getCharacteristic(DEVICE_NAME_CHAR_UUID) ?: return
+        gatt.readCharacteristic(deviceNameCharacteristic)
+    }
+
+    private companion object {
+        private const val UNKNOWN_DEVICE_NAME = "Unknown"
+        private val GENERIC_ACCESS_SERVICE_UUID: UUID =
+            UUID.fromString("00001800-0000-1000-8000-00805f9b34fb")
+        private val DEVICE_NAME_CHAR_UUID: UUID =
+            UUID.fromString("00002a00-0000-1000-8000-00805f9b34fb")
+    }
+
     private val gattCallback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             if (status != BluetoothGatt.GATT_SUCCESS) {
@@ -322,6 +395,7 @@ class BleRepositoryImpl @Inject constructor(
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 mapCharacteristics(gatt.services)
+                readDeviceNameFromGatt(gatt)
             } else {
                 _connectionState.value = ConnectionState.Error("Service discovery failed: $status")
             }
@@ -332,6 +406,13 @@ class BleRepositoryImpl @Inject constructor(
             characteristic: BluetoothGattCharacteristic,
             status: Int
         ) {
+            if (characteristic.uuid == DEVICE_NAME_CHAR_UUID && status == BluetoothGatt.GATT_SUCCESS) {
+                val payload = characteristic.value ?: ByteArray(0)
+                val resolvedName = String(payload, StandardCharsets.UTF_8).trim()
+                if (resolvedName.isNotEmpty()) {
+                    cacheResolvedName(gatt.device.address, resolvedName)
+                }
+            }
             val op = activeOperation
             if (op is GattOperation.Read) {
                 if (status == BluetoothGatt.GATT_SUCCESS) {

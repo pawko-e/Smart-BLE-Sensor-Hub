@@ -181,7 +181,19 @@ class BleViewModel @Inject constructor(
                 existing.lastSeenMs = now
             }
         }
+        val selected = _state.value.selectedDevice
+        if (selected != null) {
+            val refreshed = devices.firstOrNull { it.address == selected.address }
+            if (refreshed != null && isBetterDeviceName(current = selected.name, candidate = refreshed.name)) {
+                _state.update { it.copy(selectedDevice = refreshed) }
+            }
+        }
         refreshTrackedDevices(now)
+    }
+
+    private fun isBetterDeviceName(current: String, candidate: String): Boolean {
+        if (candidate.equals("Unknown", ignoreCase = true)) return false
+        return current.equals("Unknown", ignoreCase = true) || candidate.length > current.length
     }
 
     private fun refreshTrackedDevices(now: Long = System.currentTimeMillis()) {
