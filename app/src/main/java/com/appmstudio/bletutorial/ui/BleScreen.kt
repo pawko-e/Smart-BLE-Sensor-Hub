@@ -9,7 +9,6 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -21,6 +20,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Divider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
@@ -33,7 +33,6 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
@@ -59,8 +58,16 @@ fun BleScreen(
             paddingValues = paddingValues,
             state = BleViewModel.UiState(
                 devices = listOf(
-                    BleDevice("Demo Sensor", "AA:BB:CC:DD:EE:FF", -42),
-                    BleDevice("Weather Tag", "11:22:33:44:55:66", -60)
+                    BleViewModel.ScannedDeviceItem(
+                        device = BleDevice("Demo Sensor", "AA:BB:CC:DD:EE:FF", -42),
+                        status = BleViewModel.ScanStatus.Live,
+                        seenAgoMs = 300
+                    ),
+                    BleViewModel.ScannedDeviceItem(
+                        device = BleDevice("Weather Tag", "11:22:33:44:55:66", -60),
+                        status = BleViewModel.ScanStatus.Stale,
+                        seenAgoMs = 6_200
+                    )
                 ),
                 selectedDevice = BleDevice("Demo Sensor", "AA:BB:CC:DD:EE:FF", -42),
                 connectionState = ConnectionState.Connected,
@@ -168,11 +175,17 @@ private fun BleScreenContent(
                     label = { Text("Name filter (optional)") },
                     modifier = Modifier.fillMaxWidth()
                 )
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(onClick = { onStartScan(nameFilter.ifBlank { null }) }) {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(
+                        onClick = { onStartScan(nameFilter.ifBlank { null }) },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
                         Text(if (state.isScanning) "Scanning..." else "Start scan")
                     }
-                    TextButton(onClick = onStopScan) {
+                    TextButton(
+                        onClick = onStopScan,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
                         Text("Stop")
                     }
                 }
@@ -189,8 +202,11 @@ private fun BleScreenContent(
                         verticalArrangement = Arrangement.spacedBy(8.dp),
                         modifier = Modifier.height(220.dp)
                     ) {
-                        items(state.devices) { device ->
-                            DeviceRow(device = device, onConnect = { onConnect(device) })
+                        items(
+                            items = state.devices,
+                            key = { it.device.address }
+                        ) { scanned ->
+                            DeviceRow(scanned = scanned, onConnect = { onConnect(scanned.device) })
                         }
                     }
                 }
@@ -207,15 +223,22 @@ private fun BleScreenContent(
                 state.selectedDevice?.let {
                     Text("Device: ${it.name} (${it.address})")
                 }
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(onClick = onRead) { Text("Read") }
-                    Button(onClick = { onSetNotify(true) }) { Text("Enable notify") }
-                    Button(onClick = { onSetNotify(false) }) { Text("Disable notify") }
-                }
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(onClick = onRequestMtu) { Text("Request MTU 247") }
-                    Button(onClick = onBond) { Text("Bond") }
-                    TextButton(onClick = onDisconnect) { Text("Disconnect") }
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(onClick = onRead, modifier = Modifier.fillMaxWidth()) { Text("Read") }
+                    Button(
+                        onClick = { onSetNotify(true) },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("Enable notify") }
+                    Button(
+                        onClick = { onSetNotify(false) },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("Disable notify") }
+                    Button(onClick = onRequestMtu, modifier = Modifier.fillMaxWidth()) { Text("Request MTU 247") }
+                    Button(onClick = onBond, modifier = Modifier.fillMaxWidth()) { Text("Bond") }
+                    TextButton(
+                        onClick = onDisconnect,
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("Disconnect") }
                 }
                 Divider()
                 OutlinedTextField(
@@ -241,19 +264,47 @@ private fun BleScreenContent(
 }
 
 @Composable
-private fun DeviceRow(device: BleDevice, onConnect: () -> Unit) {
-    Card(modifier = Modifier.fillMaxWidth()) {
-        Row(
+private fun DeviceRow(scanned: BleViewModel.ScannedDeviceItem, onConnect: () -> Unit) {
+    val statusColor = when (scanned.status) {
+        BleViewModel.ScanStatus.New -> MaterialTheme.colorScheme.primary
+        BleViewModel.ScanStatus.Live -> Color(0xFF2E7D32)
+        BleViewModel.ScanStatus.Stale -> MaterialTheme.colorScheme.onSurfaceVariant
+    }
+    val statusLabel = when (scanned.status) {
+        BleViewModel.ScanStatus.New -> "New"
+        BleViewModel.ScanStatus.Live -> "Live"
+        BleViewModel.ScanStatus.Stale -> "Stale"
+    }
+    val seenSeconds = scanned.seenAgoMs / 1000
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = if (scanned.status == BleViewModel.ScanStatus.Stale) {
+                MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)
+            } else {
+                MaterialTheme.colorScheme.surface
+            }
+        )
+    ) {
+        Column(
             modifier = Modifier.padding(12.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             Column {
-                Text(device.name, fontWeight = FontWeight.SemiBold)
-                Text(device.address, style = MaterialTheme.typography.bodySmall)
-                Text("RSSI: ${device.rssi}", style = MaterialTheme.typography.bodySmall)
+                Text(scanned.device.name, fontWeight = FontWeight.SemiBold)
+                Text(scanned.device.address, style = MaterialTheme.typography.bodySmall)
+                Text("RSSI: ${scanned.device.rssi}", style = MaterialTheme.typography.bodySmall)
+                Text(
+                    "Status: $statusLabel${if (seenSeconds > 0) " ($seenSeconds s ago)" else ""}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = statusColor
+                )
             }
-            Button(onClick = onConnect) { Text("Connect") }
+            Button(
+                onClick = onConnect,
+                modifier = Modifier.fillMaxWidth()
+            ) { Text("Connect") }
         }
     }
 }

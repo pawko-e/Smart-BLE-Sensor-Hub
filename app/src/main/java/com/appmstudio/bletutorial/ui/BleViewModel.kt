@@ -24,8 +24,18 @@ class BleViewModel @Inject constructor(
     private val sensorRepository: SensorRepository
 ) : ViewModel() {
 
+    enum class ScanStatus {
+        New, Live, Stale
+    }
+
+    data class ScannedDeviceItem(
+        val device: BleDevice,
+        val status: ScanStatus,
+        val seenAgoMs: Long
+    )
+
     data class UiState(
-        val devices: List<BleDevice> = emptyList(),
+        val devices: List<ScannedDeviceItem> = emptyList(),
         val isScanning: Boolean = false,
         val selectedDevice: BleDevice? = null,
         val connectionState: ConnectionState = ConnectionState.Disconnected,
@@ -40,11 +50,28 @@ class BleViewModel @Inject constructor(
     val state: StateFlow<UiState> = _state
 
     private var historyJob: Job? = null
+    private val trackedDevices = linkedMapOf<String, TrackedDevice>()
+
+    private data class TrackedDevice(
+        var device: BleDevice,
+        val firstSeenMs: Long,
+        var lastSeenMs: Long
+    )
+
+    private val liveThresholdMs = 2_500L
+    private val newThresholdMs = 5_000L
+    private val removeAfterMs = 20_000L
 
     init {
         viewModelScope.launch {
             bleRepository.scannedDevices.collect { devices ->
-                _state.update { it.copy(devices = devices) }
+                mergeScanResults(devices)
+            }
+        }
+        viewModelScope.launch {
+            while (true) {
+                refreshTrackedDevices()
+                kotlinx.coroutines.delay(1_000L)
             }
         }
         viewModelScope.launch {
@@ -80,8 +107,9 @@ class BleViewModel @Inject constructor(
     }
 
     fun startScan(nameFilter: String?) {
+        trackedDevices.clear()
         bleRepository.startScan(nameFilter)
-        _state.update { it.copy(isScanning = true) }
+        _state.update { it.copy(isScanning = true, devices = emptyList()) }
     }
 
     fun stopScan() {
@@ -136,5 +164,48 @@ class BleViewModel @Inject constructor(
             payload.isNotEmpty() -> payload[0].toInt().toFloat()
             else -> 0f
         }
+    }
+
+    private fun mergeScanResults(devices: List<BleDevice>) {
+        val now = System.currentTimeMillis()
+        devices.forEach { device ->
+            val existing = trackedDevices[device.address]
+            if (existing == null) {
+                trackedDevices[device.address] = TrackedDevice(
+                    device = device,
+                    firstSeenMs = now,
+                    lastSeenMs = now
+                )
+            } else {
+                existing.device = device
+                existing.lastSeenMs = now
+            }
+        }
+        refreshTrackedDevices(now)
+    }
+
+    private fun refreshTrackedDevices(now: Long = System.currentTimeMillis()) {
+        val iterator = trackedDevices.entries.iterator()
+        while (iterator.hasNext()) {
+            val entry = iterator.next()
+            val age = now - entry.value.lastSeenMs
+            if (age > removeAfterMs) {
+                iterator.remove()
+            }
+        }
+        val uiDevices = trackedDevices.values.map { tracked ->
+            val age = (now - tracked.lastSeenMs).coerceAtLeast(0L)
+            val status = when {
+                now - tracked.firstSeenMs <= newThresholdMs -> ScanStatus.New
+                age <= liveThresholdMs -> ScanStatus.Live
+                else -> ScanStatus.Stale
+            }
+            ScannedDeviceItem(
+                device = tracked.device,
+                status = status,
+                seenAgoMs = age
+            )
+        }
+        _state.update { it.copy(devices = uiDevices) }
     }
 }
